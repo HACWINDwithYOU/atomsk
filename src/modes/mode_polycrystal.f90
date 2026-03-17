@@ -101,6 +101,8 @@ INTEGER,DIMENSION(:,:),ALLOCATABLE:: vnodesNeighList  !list of neighbours for no
 REAL(dp):: boxmax      !max. distance from one end of the box to another
 REAL(dp):: distance    !distance between two points
 REAL(dp):: maxdnodes   !maximum distance between 2 nodes
+REAL(dp),DIMENSION(3):: aniso      !anisotropic Voronoi scale factors (a,b,c); default 1,1,1
+REAL(dp),DIMENSION(3,3):: H_s      !scaled box vectors for anisotropic Voronoi
 REAL(dp):: P1, P2, P3  !temporary position
 REAL(dp):: seed_density !density of the seed (N.atoms/Volume)
 REAL(dp):: Volume, Vmin, Vmax, Vstep  !min, max. volume occupied by a grain, step for grain size distribution
@@ -129,6 +131,7 @@ REAL(dp),DIMENSION(:,:),ALLOCATABLE:: AUX_Q     !auxiliary properties of atoms i
 REAL(dp),DIMENSION(:,:),ALLOCATABLE:: AUX       !auxiliary properties of atoms in the final supercell
 REAL(dp),DIMENSION(:,:),ALLOCATABLE:: newAUX    !auxiliary properties of atoms (temporary)
 REAL(dp),DIMENSION(:,:),ALLOCATABLE:: vnodes    !cartesian coordinate of each node
+REAL(dp),DIMENSION(:,:),ALLOCATABLE:: vnodes_s  !scaled node coordinates for anisotropic Voronoi
 REAL(dp),DIMENSION(:,:),ALLOCATABLE:: vvertex   !cartesian coordinate of each vertex
 REAL(dp),DIMENSION(:,:,:),ALLOCATABLE:: vorient !crystallographic orientation of each node
 !
@@ -146,6 +149,7 @@ sameplane = .FALSE.
 m=0
 Nnodes = 0
 twodim = 0  !assume system will be 3-D
+aniso(:) = 1.d0  !default: isotropic Voronoi
 IF(ALLOCATED(SELECT)) DEALLOCATE(SELECT)
 IF(ALLOCATED(NPgrains)) DEALLOCATE(NPgrains)
  C_tensor(:,:) = 0.d0
@@ -351,6 +355,20 @@ DO
     ELSEIF( line(1:7)=="protect" ) THEN
       !User asked to preserve unit cell
       protectuc = .TRUE.
+      !
+    ELSEIF( line(1:5)=="aniso" ) THEN
+      !User wants anisotropic Voronoi: distance = sqrt((dx/a)^2+(dy/b)^2+(dz/c)^2)
+      READ(line(6:),*,END=800,ERR=800) P1, P2, P3
+      aniso(1) = DABS(P1)
+      aniso(2) = DABS(P2)
+      aniso(3) = DABS(P3)
+      IF( aniso(1)<1.d-12 .OR. aniso(2)<1.d-12 .OR. aniso(3)<1.d-12 ) THEN
+        nerr=nerr+1
+        CALL ATOMSK_MSG(2800,(/TRIM(line)/),(/0.d0/))
+        GOTO 1000
+      ENDIF
+      WRITE(msg,'(a,3f10.4)') " Read aniso metric: ", aniso(1), aniso(2), aniso(3)
+      CALL ATOMSK_MSG(999,(/TRIM(msg)/),(/0.d0/))
       !
     ELSE
       !Unknown command => display warning
@@ -1013,8 +1031,27 @@ IF( .NOT. ANY( NINT(H).NE.0 ) ) THEN
   GOTO 1000
 ENDIF
 !
-!Compute boxmax = maximum distance from one end of the box to another
-boxmax = 1.1d0*VECLENGTH( (/ H(1,1) , H(2,2) , H(3,3) /)  ) + 5.d0
+!Build scaled node coordinates for anisotropic Voronoi.
+!Scaling x->x/a, y->y/b, z->z/c converts the anisotropic distance metric
+!sqrt((dx/a)^2+(dy/b)^2+(dz/c)^2) to the standard Euclidean metric so the
+!existing Voronoi code (VERLET_LIST + VEC_PLANE) works correctly without changes.
+IF(ALLOCATED(vnodes_s)) DEALLOCATE(vnodes_s)
+ALLOCATE(vnodes_s(Nnodes,3))
+DO i=1,Nnodes
+  vnodes_s(i,1) = vnodes(i,1) / aniso(1)
+  vnodes_s(i,2) = vnodes(i,2) / aniso(2)
+  vnodes_s(i,3) = vnodes(i,3) / aniso(3)
+ENDDO
+H_s(1,:) = H(1,:) / aniso(1)
+H_s(2,:) = H(2,:) / aniso(2)
+H_s(3,:) = H(3,:) / aniso(3)
+IF( ANY(ABS(aniso(:)-1.d0)>1.d-10) ) THEN
+  WRITE(msg,'(a,3f10.4)') " Anisotropic Voronoi metric (a,b,c) = ", aniso(1), aniso(2), aniso(3)
+  CALL ATOMSK_MSG(999,(/TRIM(msg)/),(/0.d0/))
+ENDIF
+!
+!Compute boxmax = maximum distance from one end of the scaled box to another
+boxmax = 1.1d0*VECLENGTH( (/ H_s(1,1) , H_s(2,2) , H_s(3,3) /)  ) + 5.d0
 WRITE(msg,*) "Max. distance for neighbor search:", boxmax
 CALL ATOMSK_MSG(999,(/TRIM(msg)/),(/0.d0/))
 !
@@ -1022,7 +1059,7 @@ CALL ATOMSK_MSG(999,(/TRIM(msg)/),(/0.d0/))
 !
 300 CONTINUE
 !Construct a neighbor list of nodes
-CALL VERLET_LIST(H,vnodes,boxmax,vnodesNeighList)
+CALL VERLET_LIST(H_s,vnodes_s,boxmax,vnodesNeighList)
 IF(nerr>0) GOTO 1000
 !WARNING: if user asks for only one grain, then vnodesNeighList is NOT ALLOCATED!
 IF(verbosity==4) THEN
@@ -1313,13 +1350,13 @@ DO inode=1,Nnodes
         DO o=-expandmatrix(3),expandmatrix(3)
           DO n=-expandmatrix(2),expandmatrix(2)
             DO m=-expandmatrix(1),expandmatrix(1)
-              !Position of the periodic image of neighbor #jnode along this Cartesian axis
-              P1 = vnodes(jnode,1) + DBLE(m)*H(1,1) + DBLE(n)*H(2,1) + DBLE(o)*H(3,1)
-              P2 = vnodes(jnode,2) + DBLE(m)*H(1,2) + DBLE(n)*H(2,2) + DBLE(o)*H(3,2)
-              P3 = vnodes(jnode,3) + DBLE(m)*H(1,3) + DBLE(n)*H(2,3) + DBLE(o)*H(3,3)
+              !Position of the periodic image of neighbor #jnode in SCALED space
+              P1 = vnodes_s(jnode,1) + DBLE(m)*H_s(1,1) + DBLE(n)*H_s(2,1) + DBLE(o)*H_s(3,1)
+              P2 = vnodes_s(jnode,2) + DBLE(m)*H_s(1,2) + DBLE(n)*H_s(2,2) + DBLE(o)*H_s(3,2)
+              P3 = vnodes_s(jnode,3) + DBLE(m)*H_s(1,3) + DBLE(n)*H_s(2,3) + DBLE(o)*H_s(3,3)
               vector = (/ P1 , P2 , P3 /)
-              !Compute distance between current node and this vertex
-              distance = VECLENGTH( vector(:) - vnodes(inode,:) )
+              !Compute distance in scaled space
+              distance = VECLENGTH( vector(:) - vnodes_s(inode,:) )
               !This image is a neighbor if distance is smaller than max. box size
               IF( distance>1.d-3 .AND. distance <= boxmax ) THEN
                 Nvertices = Nvertices+1
@@ -1328,8 +1365,8 @@ DO inode=1,Nnodes
                   !Increase size of array vvertex
                   CALL RESIZE_DBLEARRAY2(vvertex,k+10,4)
                 ENDIF
-                !Save vertex position = middle point between nodes #inode and #jnode
-                vvertex(k,1:3) = vnodes(inode,:) + (vector(:)-vnodes(inode,:))/2.d0
+                !Save vertex position = middle point in scaled space
+                vvertex(k,1:3) = vnodes_s(inode,:) + (vector(:)-vnodes_s(inode,:))/2.d0
                 vvertex(k,4) = distance
                 !
               ENDIF  !end if distance<boxmax
@@ -1389,23 +1426,23 @@ DO inode=1,Nnodes
     CALL RESIZE_DBLEARRAY2(vvertex,Nvertices+26,4,status)
   ENDIF
   !
-  !Append vertices corresponding to the replicas of current node
+  !Append vertices corresponding to the replicas of current node (in scaled space)
   WRITE(msg,'(a,i6)') "Adding self neighbors (=periodic replica of current grain)"
   CALL ATOMSK_MSG(999,(/TRIM(msg)/),(/0.d0/))
   DO o=-expandmatrix(3),expandmatrix(3)
     DO n=-expandmatrix(2),expandmatrix(2)
       DO m=-expandmatrix(1),expandmatrix(1)
         IF( o.NE.0 .OR. n.NE.0 .OR. m.NE.0 ) THEN
-          !Position of the periodic image of node #inode
-          P1 = vnodes(inode,1) + DBLE(m)*H(1,1) + DBLE(n)*H(2,1) + DBLE(o)*H(3,1)
-          P2 = vnodes(inode,2) + DBLE(m)*H(1,2) + DBLE(n)*H(2,2) + DBLE(o)*H(3,2)
-          P3 = vnodes(inode,3) + DBLE(m)*H(1,3) + DBLE(n)*H(2,3) + DBLE(o)*H(3,3)
+          !Position of the periodic image of node #inode in SCALED space
+          P1 = vnodes_s(inode,1) + DBLE(m)*H_s(1,1) + DBLE(n)*H_s(2,1) + DBLE(o)*H_s(3,1)
+          P2 = vnodes_s(inode,2) + DBLE(m)*H_s(1,2) + DBLE(n)*H_s(2,2) + DBLE(o)*H_s(3,2)
+          P3 = vnodes_s(inode,3) + DBLE(m)*H_s(1,3) + DBLE(n)*H_s(2,3) + DBLE(o)*H_s(3,3)
           vector = (/ P1 , P2 , P3 /)
-          !Compute distance
-          distance = VECLENGTH( vector(:) - vnodes(inode,:) )
+          !Compute distance in scaled space
+          distance = VECLENGTH( vector(:) - vnodes_s(inode,:) )
           IF( distance>1.d-3 ) THEN
             Nvertices = Nvertices+1
-            vvertex(Nvertices,1:3) = vnodes(inode,:) + (vector(:)-vnodes(inode,:))/2.d0
+            vvertex(Nvertices,1:3) = vnodes_s(inode,:) + (vector(:)-vnodes_s(inode,:))/2.d0
             vvertex(Nvertices,4) = distance
           ENDIF
         ENDIF
@@ -1511,10 +1548,13 @@ DO inode=1,Nnodes
   !Get center of grain = barycenter of the closest vertices
   !The actual node itself is given a "weight" in this calculation, but
   !the center of the grain will be different from the position of the node itself
+  !vvertex is in scaled space; unscale back to real space for GrainCenter
   GrainCenter(:) = 0.d0
   n=MIN( SIZE(vvertex,1) , 6 )
   DO jnode=1,n
-    GrainCenter(:) = GrainCenter(:) + vvertex(jnode,:)
+    GrainCenter(1) = GrainCenter(1) + vvertex(jnode,1) * aniso(1)
+    GrainCenter(2) = GrainCenter(2) + vvertex(jnode,2) * aniso(2)
+    GrainCenter(3) = GrainCenter(3) + vvertex(jnode,3) * aniso(3)
   ENDDO
   GrainCenter(:) = ( 2.d0*vnodes(inode,1:3) + GrainCenter(:) ) / DBLE(n+2)
   IF( verbosity==4 ) THEN
@@ -1547,12 +1587,15 @@ DO inode=1,Nnodes
 !         ENDIF
 !       ENDDO
     ELSE
-      !Compute vector between atom and current node
-      vector(:) = Pt2(i,1:3) - vnodes(inode,:)
+      !Compute vector between atom and current node, scaled to Voronoi metric space
+      !(vvertex and vnodes_s are both in scaled space)
+      vector(1) = (Pt2(i,1) - vnodes(inode,1)) / aniso(1)
+      vector(2) = (Pt2(i,2) - vnodes(inode,2)) / aniso(2)
+      vector(3) = (Pt2(i,3) - vnodes(inode,3)) / aniso(3)
       DO jnode = 1 , SIZE(vvertex,1)
-        !Compute vector between the vertex and current node
-        !By definition this vector is normal to the grain boundary
-        vnormal(:) = vvertex(jnode,:) - vnodes(inode,:)
+        !Compute vector between the vertex and current node (both in scaled space)
+        !By definition this vector is normal to the grain boundary in scaled metric
+        vnormal(:) = vvertex(jnode,1:3) - vnodes_s(inode,:)
         IF( VEC_PLANE(vnormal,VECLENGTH(vnormal),vector) > -1.d-12 ) THEN
           !Atom is above this plane of cut, hence out of the polyhedron
           !=> exit the loop on jnode
@@ -1648,6 +1691,7 @@ IF( NP .NE. SUM(NPgrains(:)) ) THEN
   GOTO 1000
 ENDIF
 IF(ALLOCATED(Pt)) DEALLOCATE(Pt)
+IF(ALLOCATED(vnodes_s)) DEALLOCATE(vnodes_s)
 !Q now contains positions of all atoms in all the grains, but may be oversized
 !(and T contains the positions of shells, and newAUX the aux.prop. if relevant)
 !Copy atom positions into final array P with appropriate size
